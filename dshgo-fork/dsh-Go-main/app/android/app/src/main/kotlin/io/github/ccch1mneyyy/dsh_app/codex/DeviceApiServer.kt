@@ -66,6 +66,7 @@ class DeviceApiServer private constructor(private val context: Context) {
         ShellRunner.refreshAvailability(context, force = true)
         writeHandshake()
         Thread({ acceptLoop(listening) }, "codex-device-api").apply { isDaemon = true }.start()
+        maybeRestoreAccessibilityAsync()
         return status()
     }
 
@@ -106,6 +107,68 @@ class DeviceApiServer private constructor(private val context: Context) {
     }
 
     /**
+     * MIUI 覆盖安装后会清掉无障碍授权；App 自己不能重开，但 shell UID 可以写
+     * Settings.Secure。只有用户以前开通过、且当前有 Shizuku/root 时才自动写回。
+     * 必须在后台线程调用（会执行 shell 命令）。
+     */
+    fun restoreAccessibility(): Map<String, Any?> {
+        if (access.accessibilityEnabled()) {
+            access.rememberAccessibilityState()
+            return linkedMapOf("restored" to false, "reason" to "already-enabled")
+        }
+        if (!access.accessibilityWanted && !DeviceTier.atLeast(access.tier, DeviceTier.ACCESSIBILITY)) {
+            return linkedMapOf("restored" to false, "reason" to "never-enabled")
+        }
+        val tier = access.tier
+        if (tier != DeviceTier.ROOT && tier != DeviceTier.DEBUGGER) {
+            return linkedMapOf("restored" to false, "reason" to "needs-shizuku-or-root")
+        }
+        val component = "${context.packageName}/${CodexAccessibilityService::class.java.name}"
+        val read = runCatching {
+            ShellRunner.execute(context, "settings get secure enabled_accessibility_services", 8000, tier) { true }
+        }.getOrNull() ?: return linkedMapOf("restored" to false, "reason" to "shell-unavailable")
+        if (read.exitCode != 0) {
+            return linkedMapOf("restored" to false, "reason" to "read-failed", "stderr" to read.stderr.take(200))
+        }
+        val current = read.stdout.trim().let { if (it == "null") "" else it }
+        val entries = current.split(':').filter { it.isNotBlank() }
+        if (entries.none { it == component }) {
+            val next = (entries + component).joinToString(":")
+            val put = runCatching {
+                ShellRunner.execute(context, "settings put secure enabled_accessibility_services $next", 8000, tier) { true }
+            }.getOrNull() ?: return linkedMapOf("restored" to false, "reason" to "write-failed")
+            if (put.exitCode != 0) {
+                return linkedMapOf("restored" to false, "reason" to "write-failed", "stderr" to put.stderr.take(200))
+            }
+        }
+        runCatching {
+            ShellRunner.execute(context, "settings put secure accessibility_enabled 1", 8000, tier) { true }
+        }
+        synchronized(audit) {
+            audit.addLast(
+                JSONObject().put("path", "/accessibility/restore")
+                    .put("reason", "restore accessibility cleared by package update")
+                    .put("at", System.currentTimeMillis()),
+            )
+            while (audit.size > MAX_AUDIT) audit.removeFirst()
+        }
+        Thread.sleep(400)
+        val ok = access.accessibilityEnabled()
+        if (ok) access.rememberAccessibilityState()
+        return linkedMapOf("restored" to ok, "reason" to if (ok) "restored" else "still-disabled", "backend" to read.backend)
+    }
+
+    /** 通道打开时在没有活动回合的情况下自动尝试一次，失败不影响通道本身。 */
+    fun maybeRestoreAccessibilityAsync() {
+        if (access.accessibilityEnabled()) return
+        if (!access.accessibilityWanted && !DeviceTier.atLeast(access.tier, DeviceTier.ACCESSIBILITY)) return
+        Thread({
+            runCatching { restoreAccessibility() }
+                .onFailure { android.util.Log.d("CodexDevice", "accessibility restore failed: ${it.message}") }
+        }, "codex-a11y-restore").apply { isDaemon = true }.start()
+    }
+
+    /**
      * App 进程重启后，上个进程写的握手文件指向的端口已经没人监听。
      * 谁置位：只有 [start]；谁清除：[stop] 和这里的启动清理。
      */
@@ -118,6 +181,7 @@ class DeviceApiServer private constructor(private val context: Context) {
     @Synchronized
     fun status(): Map<String, Any?> {
         val open = isRunning
+        access.rememberAccessibilityState()
         return linkedMapOf(
             "enabled" to open,
             "baseUrl" to if (open) baseUrl() else null,

@@ -1567,7 +1567,9 @@ const server=http.createServer(async(req,res)=>{
    else if(req.method!=='POST')throw rpcCode('request/method','Use POST for this endpoint',405);
    else if(endpoint==='thread/list'){
     const value=await rpc.call('thread/list',{limit:100,sortKey:'updated_at',...(body.cwd?{cwd:body.cwd}:{})});
-    result={threads:(value.data??value.threads??[]).map(thread=>({...thread,title:thread.name??thread.preview??thread.id,updatedAt:thread.updatedAt,cwd:thread.cwd})),nextCursor:value.nextCursor??null};
+    // 子 Agent 会话不是用户的对话：默认不进历史列表，只在主对话附录/Agent 面板里出现。
+    const agentThreads=body.includeSubagents===true?null:agentRegistry.subagentThreads;
+    result={threads:(value.data??value.threads??[]).filter(thread=>!agentThreads||!agentThreads.has(thread.id)).map(thread=>({...thread,title:thread.name??thread.preview??thread.id,updatedAt:thread.updatedAt,cwd:thread.cwd})),nextCursor:value.nextCursor??null};
    }else if(endpoint==='thread/create'){
     if(body.cwd!==undefined&&typeof body.cwd!=='string')throw rpcCode('request/invalid','cwd must be a path string');
     if(body.config!==undefined&&(!body.config||typeof body.config!=='object'||Array.isArray(body.config)))throw rpcCode('request/invalid','config must be an object');

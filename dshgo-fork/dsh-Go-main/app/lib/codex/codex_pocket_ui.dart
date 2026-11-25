@@ -51,10 +51,15 @@ Future<String?> codexResumeDeviceChannel({bool isAndroid = true, CodexDeviceChan
   await CodexDeviceChannelPrefs.markEnabled(true);
   // 系统无障碍授权在**每次 APK 更新后都会被清掉**（真机实测 enabled_accessibility_services=null），
   // 于是通道能起来、档位却回落到 standard，读屏/点击全部 device/permission-denied。
-  // App 不能自己重新授权，只能明确告诉用户点哪里。
-  // 注意别用 snapshot.tier 判断：档位是 App 记的，系统无障碍被清掉后它仍是 accessibility，
-  // 而真正决定读屏能不能用的是 tiers.accessibility / permissions.accessibility。
-  final accessibilityReady = snapshot.tiers['accessibility'] == true;
+  // 有 Shizuku/root 时由 shell UID 把授权写回系统设置，用户不用每次手动重开。
+  var accessibilityReady = snapshot.tiers['accessibility'] == true;
+  if (!accessibilityReady) {
+    final restored = await (channel ?? CodexDeviceChannel()).restoreAccessibility();
+    if (restored['restored'] == true) {
+      final after = await (channel ?? CodexDeviceChannel()).status();
+      accessibilityReady = after.tiers['accessibility'] == true;
+    }
+  }
   if (!accessibilityReady || snapshot.tier == 'standard') {
     return '系统无障碍授权被清掉了（每次更新后都会）：点右侧「去开启」，重新勾选 Codex Pocket。';
   }
@@ -186,6 +191,7 @@ class _CodexPocketHomeState extends State<CodexPocketHome> with WidgetsBindingOb
   String? _agentParentThread;
   String? _agentReturnCandidate;
   bool _openingAgent = false;
+  bool _wasConnected = false;
   String? _activeAgentThreadId;
   String _activeAgentName = '';
 
@@ -302,7 +308,16 @@ class _CodexPocketHomeState extends State<CodexPocketHome> with WidgetsBindingOb
     if (!mounted) return;
     await state.connect();
     if (!mounted) return;
+    unawaited(_loadAgentBoard());
     await _restoreLastConversation();
+  }
+
+  /// 主对话附录要有数据：连上桥就拉一次子 Agent 树（失败不影响对话）。
+  Future<void> _loadAgentBoard() async {
+    try {
+      final snapshot = await state.client.get('/api/subagent/tree');
+      state.agents.replaceSnapshot(snapshot);
+    } catch (_) {}
   }
 
   Future<void> _loadRuntime() async {
@@ -473,6 +488,12 @@ class _CodexPocketHomeState extends State<CodexPocketHome> with WidgetsBindingOb
 
   void _changed() {
     if (!mounted) return;
+    if (state.connected && !_wasConnected) {
+      _wasConnected = true;
+      unawaited(_loadAgentBoard());
+    } else if (!state.connected) {
+      _wasConnected = false;
+    }
     // State.threadId is null while resumeThread is still loading; only leave
     // agent mode when a different, real thread became active.
     if (!_openingAgent &&
@@ -651,6 +672,7 @@ class _CodexPocketHomeState extends State<CodexPocketHome> with WidgetsBindingOb
                     children: [
                       _agentStrip(),
                       Expanded(child: _conversation()),
+                      _chatAgentAppendix(),
                       if (_activeAgentThreadId != null) _agentConversationBanner(),
                       if (state.statusHint != null) _statusHintLine(state.statusHint!),
                       _composerBox(),
@@ -811,6 +833,7 @@ class _CodexPocketHomeState extends State<CodexPocketHome> with WidgetsBindingOb
     } finally {
       _openingAgent = false;
     }
+    if (parent != null && parent.isNotEmpty) await state.rememberMainThread(parent);
   }
 
   Future<void> _returnFromAgent() async {
@@ -829,7 +852,10 @@ class _CodexPocketHomeState extends State<CodexPocketHome> with WidgetsBindingOb
     for (final candidate in candidates) {
       if (state.error != null) state.clearError();
       await state.resumeThread(candidate);
-      if (state.error == null) return;
+      if (state.error == null) {
+        await state.rememberMainThread(candidate);
+        return;
+      }
     }
     // No usable parent thread (for example an agent recorded with a synthetic
     // parent id): clear the error and let the user pick a conversation.
@@ -862,6 +888,61 @@ class _CodexPocketHomeState extends State<CodexPocketHome> with WidgetsBindingOb
       ],
     ),
   );
+
+  /// 主对话下方的「子 Agent 附录」：子会话不进历史列表，只挂在这里，
+  /// 点一条即可进入那个独立对话继续派任务。
+  Widget _chatAgentAppendix() {
+    if (_activeAgentThreadId != null) return const SizedBox.shrink();
+    final agents = state.agents.agents.where((agent) => agent.agentThreadId?.isNotEmpty == true).toList();
+    if (agents.isEmpty) return const SizedBox.shrink();
+    final running = agents.where((agent) => agent.active).length;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 0, 16, 6),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Icon(Icons.account_tree_outlined, size: 15, color: Color(0xff5d6b52)),
+              const SizedBox(width: 5),
+              Text(
+                '子 Agent（${agents.length}${running > 0 ? ' · $running 运行中' : ''}）',
+                style: const TextStyle(fontSize: 11.5, color: Color(0xff5d6b52), fontWeight: FontWeight.w600),
+              ),
+              const Spacer(),
+              Text('不占用历史会话', style: TextStyle(fontSize: 10.5, color: _theme.muted)),
+            ],
+          ),
+          const SizedBox(height: 6),
+          SizedBox(
+            height: 34,
+            child: ListView.separated(
+              scrollDirection: Axis.horizontal,
+              itemCount: agents.length,
+              separatorBuilder: (_, _) => const SizedBox(width: 8),
+              itemBuilder: (context, index) {
+                final agent = agents[index];
+                return ActionChip(
+                  key: ValueKey('appendix-agent-${agent.agentId}'),
+                  avatar: Icon(
+                    agent.active
+                        ? Icons.autorenew
+                        : (agent.state == 'done' ? Icons.check_circle_outline : Icons.error_outline),
+                    size: 15,
+                    color: agent.active
+                        ? const Color(0xff7a6320)
+                        : (agent.state == 'done' ? const Color(0xff2f5d3a) : const Color(0xff8b2b20)),
+                  ),
+                  label: Text(agent.name, style: const TextStyle(fontSize: 11.5)),
+                  onPressed: () => _openAgentConversation(agent),
+                );
+              },
+            ),
+          ),
+        ],
+      ),
+    );
+  }
 
   /// 标题栏两枚 20px 图标（汉堡 + 历史），总宽压在 96 以内，别把标题挤没了。
   static const double _appBarLeadingWidth = 92;

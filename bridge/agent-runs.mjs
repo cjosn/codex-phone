@@ -32,6 +32,8 @@ export class AgentRunRegistry {
     this.onChange = typeof onChange === 'function' ? onChange : null;
     this.runs = new Map();
     this.threads = new Map();
+    // 子会话 id 要长期记住：完成后路由表会清空，但历史列表仍必须排除它。
+    this.subagentThreads = new Set();
     this.version = 0;
   }
 
@@ -61,6 +63,7 @@ export class AgentRunRegistry {
       run.logBytes = run.logs.reduce((sum, log) => sum + bytes(JSON.stringify(log)), 0);
       this.runs.set(run.agentId, run);
       if (run.agentThreadId) this.threads.set(run.agentThreadId, run.agentId);
+      if (run.agentThreadId) this.subagentThreads.add(run.agentThreadId);
       restored++;
     }
     if (restored) this.onChange?.(this.view());
@@ -91,6 +94,7 @@ export class AgentRunRegistry {
     if (run.agentThreadId) this.threads.delete(run.agentThreadId);
     run.agentThreadId = threadId;
     this.threads.set(threadId, agentId);
+    this.subagentThreads.add(threadId);
     run.revision++;
     run.state = 'running';
     run.startedAt ??= this.now();

@@ -432,6 +432,9 @@ class CodexPocketState extends ChangeNotifier {
 
   String systemPrompt = '';
 
+  /// 子 Agent 的线程只是主对话的附录，不该成为「下次启动回到的会话」。
+  Future<void> rememberMainThread(String id) => _rememberThread(id);
+
   Future<void> loadSystemPrompt() async {
     try {
       final prefs = await SharedPreferences.getInstance();

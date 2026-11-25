@@ -59,9 +59,25 @@ class DeviceAccess(context: Context) {
     /** 「立即退回标准权限」：档位回到 standard；同意记录保留（它只是免责声明，不是权限）。 */
     fun resetToStandard() {
         tier = DeviceTier.STANDARD
+        accessibilityWanted = false
     }
 
     fun accessibilityEnabled(): Boolean = CodexAccessibilityService.isEnabled(app)
+
+    /**
+     * MIUI 在覆盖安装后会清掉无障碍授权。用户一旦开通过，这里记住"想要无障碍"，
+     * 之后由 Shizuku/root 在启动时自动写回系统设置（App 自己不能重开无障碍）。
+     * 谁置位：观察到无障碍已启用时；谁清除：用户点"立即退回标准权限"。
+     */
+    var accessibilityWanted: Boolean
+        get() = prefs.getBoolean(KEY_A11Y_WANT, false)
+        set(value) {
+            prefs.edit().putBoolean(KEY_A11Y_WANT, value).apply()
+        }
+
+    fun rememberAccessibilityState() {
+        if (accessibilityEnabled()) accessibilityWanted = true
+    }
 
     /**
      * 存储权限：Android 11+ 看「所有文件访问」；更老的系统看运行时存储权限
@@ -192,5 +208,6 @@ class DeviceAccess(context: Context) {
     private companion object {
         const val KEY_TIER = "tier"
         const val KEY_CONSENT = "consent"
+        const val KEY_A11Y_WANT = "accessibilityWanted"
     }
 }

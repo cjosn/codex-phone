@@ -527,6 +527,11 @@ test('bridge handshake, subagent runs, provider model fetch and toolpacks follow
       assert.equal(tree.agents[0].state, 'done');
       assert.equal(tree.agents[0].agentThreadId, run.body.threadId);
       assert(tree.agents[0].logs.some(log => log.type === 'text.delta' && log.text.includes('中文🙂')));
+      // 子 Agent 的会话不进主历史；显式要求时才返回。
+      const history = await api('thread/list', {});
+      assert(!history.body.threads.some(thread => thread.id === run.body.threadId), 'subagent threads must not pollute user history');
+      const withSubagents = await api('thread/list', { includeSubagents: true });
+      assert(withSubagents.body.threads.some(thread => thread.id === run.body.threadId));
     });
     await t.test('subagent validation, failure and timeout use stable codes', async () => {
       assert.equal((await api('subagent/run', {})).status, 400);

@@ -75,6 +75,14 @@ class CodexDevicePlugin : FlutterPlugin, ActivityAware, MethodChannel.MethodCall
                 "acceptConsent" -> result.success(device.acceptConsent())
                 "audit" -> result.success(device.auditSnapshot())
                 "openSettings" -> result.success(openSettings(call.argument<String>("target").orEmpty()))
+                "restoreAccessibility" -> {
+                    // Shell execution blocks; keep the platform channel off the UI thread.
+                    Thread({
+                        val value = runCatching { device.restoreAccessibility() }
+                            .getOrElse { mapOf("restored" to false, "reason" to (it.message ?: "failed")) }
+                        android.os.Handler(android.os.Looper.getMainLooper()).post { result.success(value) }
+                    }, "codex-a11y-restore-call").apply { isDaemon = true }.start()
+                }
                 else -> result.notImplemented()
             }
         } catch (cause: DeviceError) {

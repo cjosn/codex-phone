@@ -130,6 +130,19 @@ class CodexDeviceChannel {
 
   Future<CodexDeviceSnapshot> acceptConsent() => _snapshot('acceptConsent');
 
+  /// MIUI 覆盖安装会清掉无障碍；这里让原生用 Shizuku/root 把授权写回系统设置。
+  /// 返回 `{restored, reason, backend?}`，失败不抛异常（旧版本没有这个方法）。
+  Future<Map<String, dynamic>> restoreAccessibility() async {
+    try {
+      final value = await _channel.invokeMethod<Map<Object?, Object?>>('restoreAccessibility');
+      return value?.map((key, item) => MapEntry(key.toString(), item)) ?? const {};
+    } on MissingPluginException {
+      return const {'restored': false, 'reason': 'unsupported'};
+    } on PlatformException catch (error) {
+      return {'restored': false, 'reason': error.message ?? error.code};
+    }
+  }
+
   /// 跳系统设置页 / 弹系统权限对话框；跳不动时 `opened=false`，页面给文字指引。
   Future<CodexPermissionResult> openSettings(String target) async {
     try {

@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 「设置 → 手机能力」ACCESSIBILITY 档的无障碍服务配置（codex/CodexAccessibilityService.kt）。
+     只读控件树 + 手势 + 截图；不监听按键、不读通知。 -->
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeAllMask"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:accessibilityFlags="flagDefault|flagReportViewIds|flagRetrieveInteractiveWindows"
+    android:canPerformGestures="true"
+    android:canRetrieveWindowContent="true"
+    android:description="@string/codex_device_accessibility_description"
+    android:notificationTimeout="100"
+    android:summary="@string/codex_device_accessibility_summary" />

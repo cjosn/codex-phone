@@ -59,7 +59,8 @@
 
 ### `POST /ui/dump` → 无障碍读屏
 请求：`{"includeInvisible":false,"maxNodes":1500}`
-成功：`{"nodes":[{"index":0,"className":"android.widget.TextView","text":"WLAN","desc":null,"resourceId":"android:id/title","bounds":[40,120,300,180],"clickable":true,"enabled":true,"focused":false,"depth":4}],"screens":[{"width":1080,"height":2460}],"truncated":false}`
+成功：`{"nodes":[{"index":0,"className":"android.widget.TextView","text":"WLAN","desc":null,"resourceId":"android:id/title","bounds":[40,120,300,180],"clickable":true,"enabled":true,"focused":false,"password":false,"depth":4}],"screens":[{"width":1080,"height":2460}],"truncated":false}`
+`password:true` 表示这是密码框：`screen` 工具据此只渲染「密码框」而绝不显示内容（`text` 字段仍可能是系统给的掩码，模型不该据此猜原文）。
 失败：`device/permission-denied`（无障碍未开）。
 
 ### `POST /ui/tap` → 点击

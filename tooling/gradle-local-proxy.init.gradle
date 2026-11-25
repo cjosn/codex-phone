@@ -1,0 +1,19 @@
+allprojects {
+    buildscript {
+        repositories {
+            maven { url = uri('http://127.0.0.1:18766'); allowInsecureProtocol = true }
+        }
+    }
+}
+settingsEvaluated { settings ->
+    settings.pluginManagement.repositories.clear()
+    settings.pluginManagement.repositories.maven {
+        url = uri('http://127.0.0.1:18765')
+        allowInsecureProtocol = true
+    }
+    settings.dependencyResolutionManagement.repositories.clear()
+    settings.dependencyResolutionManagement.repositories.maven {
+        url = uri('http://127.0.0.1:18765')
+        allowInsecureProtocol = true
+    }
+}

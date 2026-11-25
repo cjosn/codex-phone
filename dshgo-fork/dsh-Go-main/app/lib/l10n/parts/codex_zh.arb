@@ -1,0 +1,15 @@
+{
+  "codexTitle": "Codex 工作台",
+  "codexSetupContinue": "进入 Codex Go（也可稍后配置模型）",
+  "codexEngineStartFailed": "引擎启动失败，请打开本地引擎与日志检查。", 
+  "codexIntro": "独立的 Codex Go 移动端，基于 dsh-go 构建。手机本地运行完整 DSH 引擎，使用 ChatGPT 订阅或 Responses API 接入模型。非 OpenAI 官方应用。",
+  "codexSignIn": "连接 ChatGPT / Codex",
+  "codexSignInBody": "使用浏览器授权登录；凭据由本机引擎管理。",
+  "codexResponses": "连接 Responses API",
+  "codexResponsesBody": "设置接口地址、密钥和模型；兼容自己的模型服务。",
+  "codexModels": "管理所有模型渠道",
+  "codexEngine": "本地引擎与日志",
+  "codexWeb": "打开完整 WebUI",
+  "codexRuntimeNote": "保留原生会话、审批、文件、终端、插件和配置编辑。模型能力取决于所连接的服务。KV 缓存由模型服务提供，应用显示引擎返回的用量。",
+  "codexConnectFirst": "先启动引擎并连接模型，再从下方选择新对话默认模型。"
+}

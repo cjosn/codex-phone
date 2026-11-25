@@ -21,8 +21,8 @@ App 实际使用的**网络地址**（手机端只能稳定访问 `api.github.co
 |---|---|---|
 | 检查更新 | `GET https://api.github.com/repos/cjosn/codex-phone/releases/latest` | 读 `tag_name` 与 `assets[].digest` |
 | 下载 APK | `GET https://api.github.com/repos/cjosn/codex-phone/releases/assets/<apkAssetId>` | 必须带 `Accept: application/octet-stream` |
-| 运行时清单 | `GET https://api.github.com/repos/cjosn/codex-phone/releases/latest` → 找 `runtime-arm64-v8a.json` → `GET .../releases/assets/<id>` | 见 §3 |
-| 运行时 tar | 清单里的 `url` 字段 | 必须是 **api.github.com 资产地址**，不能是 github.com |
+| 运行时清单 | `GET https://api.github.com/repos/cjosn/codex-phone/releases?per_page=10` → 在**最近若干 Release**里找第一个带 `runtime-arm64-v8a.json` 的 → `GET .../releases/assets/<id>` | 见 §3；**不只看 latest**（1.7.1/1.7.5 都漏过运行时） |
+| 运行时 tar | 清单里的 `url` 字段 | 必须是 **api.github.com 资产地址**，不能是 github.com；可以指向**其它 Release 里**的资产 id |
 
 `latest.json` 结构（App 读它做兜底）：
 
@@ -71,22 +71,39 @@ Remove-Item Env:GITHUB_TOKEN
 
 ---
 
-## 3. 发完必做的 4 条自检（缺一条就别宣布成功）
+## 3. 发完必做的自检（脚本已自动化，这里说明判据）
+
+`publish-release.ps1` 现在**自己就做这几条**，任何一条不过会在最后抛错并列出失败项：
+
+1. `releases/latest` 的 `tag_name` 等于刚发的版本。
+2. latest 里有 arm64 APK 与 `latest.json`。
+3. APK 的 `digest` 等于本地 APK 的 `sha256`。
+4. `latest.json` 里的 `version` / `sha256` 与本次发布一致。
+5. 运行时清单存在，且清单里的 `url` 能按 `Accept: application/octet-stream` 取到（HTTP 200/206），
+   `sha256` 与本地 `dist/runtime-arm64-v8a.tar.xz` 一致。
+
+> **注意资产可以跨 Release 复用**：运行时 286MB，两版 App 之间往往根本没变。
+> `upload-runtime-curl.ps1` 会先在最近 30 个 Release 里找 `sha256` 相同的既有 tar 资产，
+> 找到就直接复用它的 `asset id`（清单 url 指向它），**不再重复上传**。
+> 所以「四个资产」不是硬指标——真正的不变量是：**清单存在 + 清单指向的资产可下载 + sha256 一致**。
+
+手工核对（不想跑脚本时）：
 
 ```powershell
 $h=@{'User-Agent'='dsh'}
 $r=(Invoke-WebRequest 'https://api.github.com/repos/cjosn/codex-phone/releases/latest' -Headers $h -UseBasicParsing).Content|ConvertFrom-Json
-$r.tag_name                      # 1) 必须是刚发的 tag
-$r.assets | ForEach-Object { $_.name }   # 2) 必须四个：APK / latest.json / runtime-arm64-v8a.json / runtime-arm64-v8a.tar.xz
-$r.assets | Where-Object { $_.name -like '*.apk' } | ForEach-Object { $_.digest }  # 3) 必须等于本地 APK 的 sha256
-# 4) 运行时清单能被 api 取到，且 url 指向 api 资产
-$mid=($r.assets|Where-Object{$_.name -eq 'runtime-arm64-v8a.json'}).id
-(Invoke-WebRequest "https://api.github.com/repos/cjosn/codex-phone/releases/assets/$mid" -Headers @{Accept='application/octet-stream';'User-Agent'='dsh'} -UseBasicParsing).Content
+$r.tag_name
+$r.assets | ForEach-Object { "$($_.name) $($_.size) $($_.digest)" }
+(Get-FileHash 'dist\Codex-Pocket-<版本>-arm64.apk' -Algorithm SHA256).Hash.ToLower()
 ```
 
-本地 APK 的 sha256：
+只补运行时资产（某次发布漏了，或想给旧 tag 补）：
+
 ```powershell
-(Get-FileHash 'dist\Codex-Pocket-1.7.3-arm64.apk' -Algorithm SHA256).Hash.ToLower()
+$env:GITHUB_TOKEN='…'; Set-ExecutionPolicy -Scope Process Bypass -Force
+.\tooling\upload-runtime-curl.ps1 -Tag v1.7.6      # 优先复用，找不到才上传，带重试
+# 旧脚本（Python，遇到 286MB 可能 ssl.SSLEOFError）：
+$env:RELEASE_TAG='v1.7.6'; python tooling\upload-runtime-assets.py
 ```
 
 ---
@@ -110,4 +127,5 @@ $mid=($r.assets|Where-Object{$_.name -eq 'runtime-arm64-v8a.json'}).id
 | v1.6.2 / 1.6.3 | 权限向导 + 8 条系统权限 + 4 个真 bug；应用内更新端到端验证 |
 | v1.6.4 | 运行时清单/更新统一走 `api.github.com`（github.com 不可达时不再超时） |
 | v1.7.1 | 另一会话发布；**漏带运行时资产** → 已被补传（tar `777931886`，清单 `777934335`） |
-| v1.7.3 | 待发（记得带运行时资产） |
+| v1.7.5 | MCP 工具真派发（namespace 还原）、统一过程流、会话移出 rootfs；运行时**复用** 1.7.1 的 tar 资产 |
+| v1.7.6 | 「重置运行时（保留会话）」按钮；运行时清单改为在最近 10 个 Release 里找；发布脚本自带自检 |

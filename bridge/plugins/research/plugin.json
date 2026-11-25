@@ -1,0 +1,7 @@
+{
+  "name": "research",
+  "title": "深度研究",
+  "version": "1.0.0",
+  "description": "把一次研究拆成检索、交叉核对、结论三步，并强制标注来源。",
+  "author": "Codex Pocket"
+}

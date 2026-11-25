@@ -1,0 +1,15 @@
+{
+  "codexTitle": "Codex workspace",
+  "codexSetupContinue": "Enter Codex Go (or set up models later)",
+  "codexEngineStartFailed": "The engine could not start. Open local engine and logs to check.", 
+  "codexIntro": "An independent Codex Go mobile app built on dsh-go. The full DSH engine runs locally on your phone, with models connected through a ChatGPT subscription or Responses API. Not an official OpenAI app.",
+  "codexSignIn": "Connect ChatGPT / Codex",
+  "codexSignInBody": "Sign in through your browser. Your local engine manages credentials.",
+  "codexResponses": "Connect a Responses API",
+  "codexResponsesBody": "Set an endpoint, key, and models, including your own model service.",
+  "codexModels": "Manage all model providers",
+  "codexEngine": "Local engine and logs",
+  "codexWeb": "Open the full WebUI",
+  "codexRuntimeNote": "Native sessions, approvals, files, terminal, plugins, and configuration editing remain available. Model capabilities depend on your provider. KV caching is provided by the model service; the app displays usage returned by the engine.",
+  "codexConnectFirst": "Start the engine and connect a model, then choose the default for new conversations below."
+}

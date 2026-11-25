@@ -12,6 +12,10 @@ import {fileURLToPath,pathToFileURL} from 'node:url';
 import {normalize} from './adapter.mjs';
 import {WorkflowStore} from './workflows.mjs';
 import {buildListRequest,buildProbeRequest,fetchWireModels,normalizeWire,parseWireModels,requiresApiKey,start as startCompatProxy,WIRE_NAMES} from './compat-proxy.mjs';
+import {buildCodexAttachmentInput} from './attachments.mjs';
+import {AgentRunRegistry} from './agent-runs.mjs';
+import {completeLocalOAuthCallback} from './account-login.mjs';
+import {stageLargeTextAttachments} from './attachment-store.mjs';
 
 const HERE=path.dirname(fileURLToPath(import.meta.url));
 const args=process.argv.slice(2);
@@ -87,10 +91,11 @@ const MODELS_TIMEOUT_MS=20000,MODELS_MAX_BYTES=2*1024*1024;
 // 渠道探活（POST /api/channels/test）：连接 30s、推理探针 30s。
 const CHANNEL_TEST_CONNECT_TIMEOUT_MS=30000,CHANNEL_TEST_INFER_TIMEOUT_MS=30000;
 const SUBAGENT_RUNS=20,SUBAGENT_REASONING=new Set(['none','minimal','low','medium','high','xhigh']);
-const PACK_NAME=/^[a-z][a-z0-9_]{0,63}$/;
+// 包名与 TOOLPACKS-CONTRACT §3 / mcp-server.mjs 保持一致：允许连字符（例如 android-screen）。
+const PACK_NAME=/^[a-z][a-z0-9_-]{0,63}$/;
 const PLUGIN_NAME=/^[a-z][a-z0-9_-]{0,63}$/;
 const SKILL_NAME=/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/;
-const MAX_BODY=16*1024*1024;
+const MAX_BODY=128*1024*1024;
 // 中转站普遍按 User-Agent 白名单放行（只认 codex_cli_rs/… 等编程客户端）。
 const CLI_UA='codex_cli_rs/0.170.0';
 const withCliUa=headers=>({...headers,'user-agent':headers['user-agent']||CLI_UA});
@@ -108,15 +113,22 @@ const PERSONA_LIMITS={name:200,style:2000,instructions:40000};
 // AGENTS.md 适合项目说明，但不能单独承担 Agent 行为约束：项目级文件可能覆盖全局人设。
 // 这份内置规范在新建会话时通过 codex 的 developerInstructions 注入。
 const DEFAULT_AGENT_INSTRUCTIONS=`You are Codex Pocket, an autonomous coding and device agent.
-For non-trivial tasks, inspect the relevant files and current state first, make a short plan, then execute the steps instead of stopping at advice or pasted code.
+For non-trivial tasks, inspect the relevant files and current state first, make a short plan, then execute the steps instead of stopping at advice or pasted code. Use update_plan when available; otherwise use plan_create, plan_update_step and plan_complete so progress remains visible.
 Use the available tools to perform the requested work. Make small, focused changes and verify each change with the most relevant available check.
 When a command or tool fails, diagnose the actual output before retrying; do not repeat the same failing action blindly.
 Before finishing, review the final result and report only checks that actually ran, including any remaining limitations.
 When environment or tool availability is uncertain, inspect it with system/tooling_status or dev/env_probe rather than guessing.
+If the MCP tools are not exposed in your tool list (you only see exec_command and write_stdin), or a call comes back "unsupported call: <name>", reach them through the phone CLI instead: run node /opt/codex-go/bridge/phone.mjs screen to read the phone screen as numbered lines, then phone.mjs tap <id>, type, key, scroll, apps, open or collect. Read that screen before every action and never claim you cannot see the phone while that command works.
 Respect the active permission boundary and ask before destructive or irreversible actions.`;
 const startedAt=Date.now();
 let seq=0,stopping=false,codexVersion=null;
 const ring=[],sse=new Set(),turns=new Map(),pendingApprovals=new Map(),loadingThreads=new Set();
+// 用户点了「本会话允许」的 MCP server：之后该 server 的工具不再逐次弹审批。
+const sessionApprovedMcp=new Set();
+// 每个 thread 最近一次 turn/start 用的审批策略（never = 完全权限）。
+const threadApprovalPolicy=new Map();
+// 每个 thread 的沙箱：danger-full-access 时 MCP 工具审批纯属噪音，直接放行。
+const threadSandboxMode=new Map();
 // thread -> 建线程时绑定的 provider（渠道）。codex 0.170 的 turn/start 只能换 model，
 // thread/resume 的 model/modelProvider 会被忽略，只有 thread/fork 能换 provider，
 // 所以必须记住绑定关系：否则切渠道后老会话会拿新渠道的模型名去打旧上游（404 重试 5 次）。
@@ -153,13 +165,25 @@ const secureEqual=(a,b)=>{const aa=Buffer.from(a||''),bb=Buffer.from(b||'');retu
 // 只有「真的在产出」的事件才续命看门狗：正文/思考/工具/计划/审批。
 // `usage`、`account.updated`、`thread.status`、`error`（Reconnecting 噪音）都不算进展——
 // 否则上游断流时这些心跳会把 120s 看门狗喂成永不触发，界面就一直「正在思考」。
-const TURN_PROGRESS_TYPES=new Set(['turn.start','text.delta','reasoning.delta','tool.start','tool.output','tool.end','diff','plan.updated','approval.request']);
+const TURN_PROGRESS_TYPES=new Set(['turn.start','text.delta','reasoning.delta','tool.start','tool.args.delta','tool.output','tool.end','diff','plan.updated','approval.request']);
 function broadcast(event){
  if(event.threadId&&TURN_PROGRESS_TYPES.has(event.type))touchTurn(event.threadId);
  const item={...event,seq:++seq,at:Date.now()};ring.push(item);if(ring.length>6000)ring.shift();
  for(const client of sse){if(client.threadId&&item.threadId&&client.threadId!==item.threadId)continue;client.res.write(`id: ${item.seq}\ndata: ${JSON.stringify(item)}\n\n`);}
  return item;
 }
+const AGENT_BOARD_FILE=path.join(CODEX_HOME,'codex-go-agents.json');
+let agentBoardTimer=null;
+function saveAgentBoard(){
+ if(agentBoardTimer)return;
+ agentBoardTimer=setTimeout(async()=>{
+  agentBoardTimer=null;
+  try{await writeFile(AGENT_BOARD_FILE+'.tmp',JSON.stringify(agentRegistry.view()),{mode:0o600});await rename(AGENT_BOARD_FILE+'.tmp',AGENT_BOARD_FILE);}
+  catch(error){console.error('codex-go: could not save the agent board: '+scrub(error.message));}
+ },250).unref();
+}
+const agentRegistry=new AgentRunRegistry({emit:broadcast,onChange:saveAgentBoard});
+const migrateApproval=value=>value==='on-failure'?'on-request':value;
 
 class CodexRpc {
  constructor(){this.process=null;this.pending=new Map();this.id=0;this.ready=false;this.version=null;}
@@ -221,7 +245,7 @@ class CodexRpc {
    // 用量可能在 turn 结束前到达；等 turn 释放后再判断自动压缩。
    queueAutoCompact(params.threadId);
   }
-   for(const event of normalize(method,params)){if(event.type==='turn.end'&&!event.status?.match(/completed/i))event.error=friendlyTurnError(event.error);subagentEvent(event);broadcast(event);}
+   for(const event of normalize(method,params)){if(event.type==='turn.end'&&!event.status?.match(/completed/i))event.error=friendlyTurnError(event.error);agentRegistry.accept(event);subagentEvent(event);broadcast(event);}
   if(method==='error')broadcast({type:'error',threadId:params.threadId,turnId:params.turnId,code:params.error?.codexErrorInfo??'codex/turn-error',message:params.error?.message??params.message??'Codex reported an error',retryable:params.willRetry===true});
   if(method==='thread/tokenUsage/updated'){
    broadcast({type:'usage',threadId:params.threadId,turnId:params.turnId,usage:params.tokenUsage});
@@ -240,9 +264,21 @@ class CodexRpc {
    }
   }
   requestFromCodex(message){
-  const supported=new Set(['item/commandExecution/requestApproval','item/fileChange/requestApproval','item/permissions/requestApproval','execCommandApproval','applyPatchApproval']);
+  const supported=new Set(['item/commandExecution/requestApproval','item/fileChange/requestApproval','item/permissions/requestApproval','mcpServer/elicitation/request','execCommandApproval','applyPatchApproval']);
   if(!supported.has(message.method)){this.reply(message.id,null,{code:-32601,message:`This mobile client does not yet support ${message.method}`});broadcast({type:'error',threadId:message.params?.threadId,code:'codex/unsupported-interaction',message:`Codex requested ${message.method}, which this client cannot answer yet.`,retryable:false});return;}
   const id=`rpc:${String(message.id)}`;
+  const threadId=message.params?.threadId;
+  const policy=threadId?threadApprovalPolicy.get(threadId):null;
+  const sandbox=threadId?threadSandboxMode.get(threadId):null;
+  const serverName=String(message.params?.serverName??'');
+  const auto=policy==='never'||sandbox==='danger-full-access'||(message.method==='mcpServer/elicitation/request'&&serverName&&sessionApprovedMcp.has(serverName));
+  if(auto){
+   if(message.method==='mcpServer/elicitation/request')this.reply(message.id,{action:'accept',content:null,_meta:null});
+   else if(message.method.includes('permissions'))this.reply(message.id,{permissions:message.params?.permissions??{},scope:'turn'});
+   else this.reply(message.id,{decision:'accept'});
+   broadcast({type:'approval.auto',threadId,approvalId:id,serverName,decision:'accept',reason:policy==='never'?'完全权限':'本会话已允许'});
+   return;
+  }
   pendingApprovals.set(id,{id:message.id,method:message.method,params:message.params||{}});
   for(const event of normalize(message.method,message.params||{},{isRequest:true,requestId:message.id})){
    const {_internal,...publicEvent}=event;broadcast({...publicEvent,approvalId:id});
@@ -342,7 +378,7 @@ async function configure(body){
   if(!['https:','http:'].includes(url.protocol)||url.username||url.password||url.hash||url.search)throw rpcCode('config/base-url','Use an HTTP(S) endpoint without embedded credentials, query or fragment');
   secretRef=`CODEX_GO_${provider.toUpperCase().replaceAll('-','_')}_KEY`;
   const existing=configValue(await rawConfig()).model_providers?.[provider]??{};
-   const profile={name:provider,base_url:url.toString().replace(/\/$/,''),wire_api:'responses',env_key:secretRef};
+   const profile={name:provider,base_url:normalizeBaseUrl(url.toString(),'openai-responses'),wire_api:'responses',env_key:secretRef};
    // codex 的 config/read 会把可选字段回成 null，直接展开会让 batchWrite 报 "invalid type: null"。
    for(const [key,value] of Object.entries(existing))if(value!==null&&value!==undefined&&!(key in profile))profile[key]=value;
    set('model_providers.'+provider,profile);
@@ -353,12 +389,12 @@ async function configure(body){
   if(provider==='openai'&&!body.baseUrl)throw rpcCode('config/api-key','For API-key access, configure a named Responses provider and its Base URL, or use Codex account login');
  }
  set('model_provider',provider);
- if(body.approvalPolicy!==undefined){if(!['on-request','untrusted','never'].includes(body.approvalPolicy))throw rpcCode('config/approval','Unsupported Codex approval policy');set('approval_policy',body.approvalPolicy);}
+ if(body.approvalPolicy!==undefined){const approvalPolicy=migrateApproval(body.approvalPolicy);if(!['on-request','untrusted','never'].includes(approvalPolicy))throw rpcCode('config/approval','Unsupported Codex approval policy');set('approval_policy',approvalPolicy);}
   if(body.sandboxMode!==undefined){if(!['read-only','workspace-write','danger-full-access'].includes(body.sandboxMode))throw rpcCode('config/sandbox','Unsupported sandbox mode');set('sandbox_mode',body.sandboxMode);}
  if(body.reasoningEffort!==undefined){if(!['none','minimal','low','medium','high','xhigh'].includes(body.reasoningEffort))throw rpcCode('config/reasoning','Unsupported reasoning effort');set('model_reasoning_effort',body.reasoningEffort);}
  await rpc.call('config/batchWrite',{edits,reloadUserConfig:true});
  if(body.apiKey!==undefined){const secrets=await readSecrets();secrets[secretRef]=body.apiKey;await saveSecrets(secrets);await rpc.restart();}
- return configView();
+ return {...await configView(),...(body.approvalPolicy==='on-failure'?{migrated:true}:{})};
 }
 
 // ---- 契约 B：多渠道（codex-go-channels.json + 本机兼容代理）----
@@ -385,8 +421,8 @@ function channelFieldWire(value){
  if(!wire)throw rpcCode('channel/wire',`wire must be one of ${WIRE_NAMES.join(', ')} (legacy chat/responses are accepted and normalized)`);
  return wire;
 }
-function channelFieldBaseUrl(value){
- try{return normalizeBaseUrl(value);}
+function channelFieldBaseUrl(value,wire='openai-responses'){
+ try{return normalizeBaseUrl(value,wire);}
  catch(error){throw rpcCode('channel/base-url',error.message,400);}
 }
 function channelFieldModel(value){
@@ -473,8 +509,8 @@ async function saveChannel(body){
  rejectChannelFields(body);
  const state=await readChannels();
  const name=channelFieldName(body.name);
- const baseUrl=channelFieldBaseUrl(body.baseUrl);
  const wire=channelFieldWire(body.wire);
+ const baseUrl=channelFieldBaseUrl(body.baseUrl,wire);
  const model=body.model===undefined||body.model===null||body.model===''?null:channelFieldModel(body.model);
  const models=body.models===undefined?null:channelFieldModels(body.models);
  if(body.apiKey!==undefined&&(typeof body.apiKey!=='string'||!body.apiKey.trim()))throw rpcCode('channel/api-key','API Key must be nonempty when supplied');
@@ -550,15 +586,17 @@ async function channelModels(body){
   channel=state.channels.find(item=>item.id===id)??null;
   if(!channel)throw rpcCode('channel/unknown',`Unknown channel: ${id}`,404,{id});
  }
- const baseUrl=body.baseUrl!==undefined?channelFieldBaseUrl(body.baseUrl):channel?channelFieldBaseUrl(channel.baseUrl):null;
- if(!baseUrl)throw rpcCode('channel/base-url','Supply a channel id or a Base URL');
  const wire=body.wire!==undefined?channelFieldWire(body.wire):channel?.wire??'openai-chat';
+ const baseUrl=body.baseUrl!==undefined?channelFieldBaseUrl(body.baseUrl,wire):channel?channelFieldBaseUrl(channel.baseUrl,wire):null;
+ if(!baseUrl)throw rpcCode('channel/base-url','Supply a channel id or a Base URL');
  if(body.apiKey!==undefined&&typeof body.apiKey!=='string')throw rpcCode('channel/api-key','apiKey must be a string when supplied');
  const supplied=typeof body.apiKey==='string'&&body.apiKey.trim()?body.apiKey.trim():null;
  const apiKey=supplied??(channel?await channelSecret(channel):null);
  // 契约 A：ollama 本地无鉴权，其它 wire 都必须有密钥。每种 wire 走自己的清单端点/鉴权/解析。
  if(!apiKey&&requiresApiKey(wire))throw rpcCode('channel/api-key','No API key is configured for this channel',400,{id:channel?.id??null,wire});
- const result=await fetchWireModels({wire,baseUrl,apiKey:apiKey??null});
+ let result;
+ try{result=await fetchWireModels({wire,baseUrl,apiKey:apiKey??null});}
+ catch(error){error.details={...error.details,baseUrl,wire};throw error;}
  return {baseUrl:result.baseUrl,models:result.models.map(model=>({id:model.id})),count:result.count};
 }
 function testErrorText(value){
@@ -576,7 +614,7 @@ async function channelTest(body){
  if(!channel)throw rpcCode('channel/unknown',`Unknown channel: ${id}`,404,{id});
  const wire=normalizeWire(channel.wire)??'openai-chat';
  const fail=(code,message,details)=>rpcCode(code,message,502,{id,wire,latencyMs:Date.now()-started,...details});
- const baseUrl=channelFieldBaseUrl(channel.baseUrl);
+ const baseUrl=channelFieldBaseUrl(channel.baseUrl,wire);
  const apiKey=await channelSecret(channel);
  if(requiresApiKey(wire)&&!apiKey)throw fail('channel/test','No API key is configured for this channel',{stage:'auth'});
  if(!channel.model)throw fail('channel/test','Choose a model for this channel before testing it',{stage:'infer'});
@@ -733,13 +771,15 @@ async function subagentText(threadId,chunks){
  }catch(error){console.error('codex-go: could not read subagent thread items: '+scrub(error.message));return '';}
 }
 async function subagentRun(body){
- const allowed=new Set(['prompt','cwd','model','reasoningEffort','timeoutMs','title']);for(const key of Object.keys(body))if(!allowed.has(key))throw rpcCode('request/invalid',`Unknown subagent field: ${key}`);
+ const allowed=new Set(['prompt','cwd','model','reasoningEffort','timeoutMs','title','name','role','parentId','parentThreadId']);for(const key of Object.keys(body))if(!allowed.has(key))throw rpcCode('request/invalid',`Unknown subagent field: ${key}`);
  const prompt=requireString(body,'prompt');
  if(body.cwd!==undefined&&(typeof body.cwd!=='string'||!body.cwd.trim()))throw rpcCode('request/invalid','cwd must be a nonempty path string');
  if(body.model!==undefined&&(typeof body.model!=='string'||!body.model.trim()))throw rpcCode('request/invalid','model must be a nonempty string');
  if(body.reasoningEffort!==undefined&&!SUBAGENT_REASONING.has(body.reasoningEffort))throw rpcCode('request/invalid','Unsupported reasoning effort');
  if(body.title!==undefined&&(typeof body.title!=='string'||!body.title.trim()||body.title.length>200))throw rpcCode('request/invalid','title must be a nonempty string of at most 200 characters');
+ for(const key of ['name','role','parentId','parentThreadId'])if(body[key]!==undefined&&(typeof body[key]!=='string'||body[key].length>200))throw rpcCode('request/invalid',`${key} must be a string of at most 200 characters`);
  const cwd=body.cwd?path.resolve(body.cwd):CWD,model=body.model?.trim(),timeoutMs=integerField(body,'timeoutMs',1000,1800000,600000);
+ const {agentId}=agentRegistry.queue({name:body.name??body.title,role:body.role,task:prompt,parentId:body.parentId,parentThreadId:body.parentThreadId});
  const run={id:`sub-${++subagentSeq}`,threadId:null,title:body.title?.trim()??(prompt.split('\n')[0].slice(0,80)||'Subagent run'),status:'running',startedAt:Date.now(),finishedAt:null,preview:prompt.slice(0,160)};
  subagentRuns.unshift(run);if(subagentRuns.length>SUBAGENT_RUNS)subagentRuns.length=SUBAGENT_RUNS;
  let threadId=null,turnId=null,watcher=null;
@@ -748,6 +788,7 @@ async function subagentRun(body){
   const started=await rpc.call('thread/start',{cwd,developerInstructions,...(model?{model}:{})});
   threadId=started?.thread?.id;if(!threadId)throw rpcCode('codex/protocol','thread/start did not return a thread',502);
   loadingThreads.add(threadId);threadInjectedInstructions.set(threadId,developerInstructions);run.threadId=threadId;
+  agentRegistry.start(agentId,{threadId});
   watcher=createSubagentWatcher(timeoutMs);subagentWatchers.set(threadId,watcher);
   const value=await rpc.call('turn/start',{threadId,input:[{type:'text',text:prompt}],summary:'auto',...(model?{model}:{}),...(body.reasoningEffort?{effort:body.reasoningEffort}:{})});
   turnId=value?.turn?.id;if(!turnId)throw rpcCode('codex/protocol','turn/start did not return a turn',502);
@@ -764,8 +805,10 @@ async function subagentRun(body){
   }
   const text=await subagentText(threadId,watcher.texts);
   run.status='completed';run.finishedAt=Date.now();if(text.trim())run.preview=text.slice(0,160);
+  agentRegistry.finish(agentId,{state:'completed'});
   return {threadId,turnId,status:'completed',text};
  }catch(error){
+  agentRegistry.finish(agentId,{state:error.code==='codex/subagent-timeout'?'timeout':'failed',error});
   if(run.status==='running'){run.status=error.code==='codex/subagent-timeout'?'timeout':'failed';run.finishedAt=Date.now();}
   throw error;
  }finally{
@@ -776,7 +819,17 @@ async function subagentRun(body){
 }
 
 // 中转站模型自动拉取：GET {baseUrl}/models，10s 超时，响应上限 2 MiB。
-function normalizeBaseUrl(value){if(typeof value!=='string'||!value.trim())throw rpcCode('provider/base-url','baseUrl is required');let url;try{url=new URL(value.trim());}catch{throw rpcCode('provider/base-url','Base URL must be absolute HTTP(S)');}if(!['https:','http:'].includes(url.protocol)||url.username||url.password||url.search||url.hash)throw rpcCode('provider/base-url','Use an HTTP(S) endpoint without embedded credentials, query or fragment');return url.toString().replace(/\/$/,'');}
+function normalizeBaseUrl(value,wire='openai-responses'){
+ if(typeof value!=='string'||!value.trim())throw rpcCode('provider/base-url','baseUrl is required');
+ let url;try{url=new URL(value.trim());}catch{throw rpcCode('provider/base-url','Base URL must be absolute HTTP(S)');}
+ if(!['https:','http:'].includes(url.protocol)||url.username||url.password||url.search||url.hash)throw rpcCode('provider/base-url','Use an HTTP(S) endpoint without embedded credentials, query or fragment');
+ const openai=wire==='openai-chat'||wire==='openai-responses'||wire==='chat'||wire==='responses';
+ const segments=url.pathname.split('/').filter(Boolean);
+ if(openai&&segments.length===0)segments.push('v1');
+ else if(openai&&segments.at(-1)?.toLowerCase()==='v')segments[segments.length-1]='v1';
+ url.pathname='/'+segments.join('/');
+ return url.toString().replace(/\/$/,'');
+}
 async function storedProviderKey(provider){
  const cfg=configValue(await rawConfig());const map=cfg.model_providers??cfg.modelProviders??{};
  const profile=map[provider];if(!profile)throw rpcCode('provider/unknown',`Unknown provider: ${provider}`,400,{provider});
@@ -1016,10 +1069,25 @@ function contextPercent(totalTokens,contextWindow){
  if(!(totalTokens>0)||!(contextWindow>0))return 0;
  return Math.min(100,Math.round((totalTokens/contextWindow)*100));
 }
+// 上下文占用 = **当前这一次请求**的 token 数，不是整个会话的累计。
+//
+// 踩过的坑：旧实现取 `tokenUsage.total.totalTokens`，而 codex 的 `total` 是会话累计
+// （实测：一条「只回复两个字」53,046；三条同样的短消息 159,447）。按累计值画进度环，
+// 用户说两句话就看到「上下文已满」，而真实内容只有几百 token。
+// `last` 才是最近一次请求的用量（≈ 当前 prompt + 回复），这里用它。
+function contextOccupancy(tokenUsage){
+ if(!tokenUsage)return 0;
+ const last=tokenUsage.last??null;
+ const fromLast=Number(last?.inputTokens)+Number(last?.outputTokens);
+ if(Number.isFinite(fromLast)&&fromLast>0)return fromLast;
+ const lastTotal=Number(last?.totalTokens);
+ if(Number.isFinite(lastTotal)&&lastTotal>0)return lastTotal;
+ const totalTotal=Number(tokenUsage?.total?.totalTokens??tokenUsage?.totalTokens);
+ return Number.isFinite(totalTotal)&&totalTotal>0?totalTotal:0;
+}
 function trackUsage(threadId,turnId,tokenUsage){
  if(!threadId)return null;
- const rawTotal=tokenUsage?.total?.totalTokens??tokenUsage?.totalTokens??tokenUsage?.last?.totalTokens??null;
- const totalTokens=Number.isFinite(Number(rawTotal))?Number(rawTotal):0;
+ const totalTokens=contextOccupancy(tokenUsage);
  const rawWindow=tokenUsage?.modelContextWindow??tokenUsage?.contextWindow??null;
  const upstreamWindow=Number.isFinite(Number(rawWindow))&&Number(rawWindow)>0?Number(rawWindow):null;
  // 用户设置优先：设置里填了窗口长度就按它算（否则「设置不生效」）。来源一起回给界面。
@@ -1410,11 +1478,22 @@ async function removePlugin(body){
  return {removed:true,name};
 }
 
-function requestBody(req){return new Promise((resolve,reject)=>{let size=0;const chunks=[];req.on('data',chunk=>{size+=chunk.length;if(size>MAX_BODY){reject(rpcCode('request/too-large','Request exceeds 16 MiB',413));req.destroy();}else chunks.push(chunk);});req.on('end',()=>{try{const data=chunks.length?JSON.parse(Buffer.concat(chunks).toString('utf8')):{};if(!data||typeof data!=='object'||Array.isArray(data))throw Error('Expected JSON object');resolve(data);}catch{reject(rpcCode('request/json','Expected a JSON object'));}});req.on('error',reject);});}
+function requestBody(req){return new Promise((resolve,reject)=>{let size=0;const chunks=[];req.on('data',chunk=>{size+=chunk.length;if(size>MAX_BODY){reject(rpcCode('request/too-large','Request exceeds 128 MiB',413));req.destroy();}else chunks.push(chunk);});req.on('end',()=>{try{const data=chunks.length?JSON.parse(Buffer.concat(chunks).toString('utf8')):{};if(!data||typeof data!=='object'||Array.isArray(data))throw Error('Expected JSON object');resolve(data);}catch{reject(rpcCode('request/json','Expected a JSON object'));}});req.on('error',reject);});}
 function json(res,status,value){res.writeHead(status,{'content-type':'application/json; charset=utf-8','cache-control':'no-store','x-content-type-options':'nosniff'});res.end(JSON.stringify(value));}
 function requireString(body,key){if(typeof body[key]!=='string'||!body[key].trim())throw rpcCode('request/invalid',`${key} is required`);return body[key];}
 function authenticated(req,url){const bearer=req.headers.authorization?.replace(/^Bearer\s+/i,'');const query=url.searchParams.get('token');return secureEqual(bearer??query,TOKEN);}
-function safeError(error){return {code:error.code??'bridge/internal',message:scrub(error.message??'Bridge request failed'),...(error.details?{details:error.details}:{})};}
+function safeError(error){
+ const code=error.code??'bridge/internal';
+ const details={...error.details};
+ if(/^provider\/models-/.test(code)&&details.baseUrl){
+  const openai=!details.wire||details.wire==='openai-chat'||details.wire==='openai-responses';
+  details.normalizedBaseUrl??=details.baseUrl;
+  details.hint??=openai
+   ?`模型列表拉取失败，已按 ${details.baseUrl} 处理。请检查 Base URL 是否少了 /v1；也可以直接手动输入模型 ID，不会被这个错误阻断。`
+   :`模型列表拉取失败，已按 ${details.baseUrl} 处理。请检查该协议的地址与密钥，或直接手动输入模型 ID。`;
+ }
+ return {code,message:scrub(error.message??'Bridge request failed'),...(Object.keys(details).length?{details}:{}),...(details.hint?{hint:details.hint,normalizedBaseUrl:details.normalizedBaseUrl}:{})};
+}
 async function history(threadId, cursor) {
  const {thread} = await rpc.call('thread/read', {threadId, includeTurns:false});
  if (thread.historyMode === 'paginated') {
@@ -1461,6 +1540,11 @@ const server=http.createServer(async(req,res)=>{
   json(res,200,{current:cfg.model_provider||'openai',model:cfg.model||null,providers:list});
   return;
  }
+   if(endpoint==='subagent/tree'&&req.method==='GET'){
+    const parentThreadId=url.searchParams.get('parentThreadId');
+    json(res,200,agentRegistry.tree(parentThreadId===null?{}:{parentThreadId}));
+    return;
+   }
    if(endpoint==='bridge/stop'&&req.method==='POST') {
     json(res,200,{stopping:true});
     setImmediate(shutdown);
@@ -1469,8 +1553,16 @@ const server=http.createServer(async(req,res)=>{
    if(endpoint==='models'&&req.method==='GET'){
     const value=await rpc.call('model/list',{includeHidden:false,limit:200});result={models:(value.data??value.models??[]).map(model=>({...model,name:model.displayName??model.name??model.id})),nextCursor:value.nextCursor??null};
    }else if(endpoint==='account'&&req.method==='GET')result=await rpc.call('account/read',{refreshToken:false});
-   else if(endpoint==='account/login/start'&&req.method==='POST')result=await rpc.call('account/login/start',{type:body.type??'chatgpt'});
-   else if(endpoint==='account/logout'&&req.method==='POST')result=await rpc.call('account/logout',{});
+   else if(endpoint==='account/login/start'&&req.method==='POST')result=await rpc.call('account/login/start',{type:body.type??'chatgpt',useHostedLoginSuccessPage:true});
+   else if(endpoint==='account/login/complete'&&req.method==='POST'){
+     const callback=await completeLocalOAuthCallback(body.callbackUrl);
+     if(!callback.ok)throw rpcCode('account/callback-rejected',`The OAuth callback was rejected with HTTP ${callback.status}; paste the complete final browser address`,400);
+     const account=await rpc.call('account/read',{refreshToken:false});
+     if(!account.account)throw rpcCode('account/not-ready','The callback was delivered, but the account is not ready yet; retry in a few seconds',409);
+     broadcast({type:'account.updated',method:'account/login/completed'});
+     result={ok:true,account:account.account};
+    }
+    else if(endpoint==='account/logout'&&req.method==='POST')result=await rpc.call('account/logout',{});
    else if(endpoint==='config')result=req.method==='GET'?await configView():req.method==='POST'?await configure(body):(()=>{throw rpcCode('request/method','Use GET or POST',405);})();
    else if(req.method!=='POST')throw rpcCode('request/method','Use POST for this endpoint',405);
    else if(endpoint==='thread/list'){
@@ -1478,7 +1570,8 @@ const server=http.createServer(async(req,res)=>{
     result={threads:(value.data??value.threads??[]).map(thread=>({...thread,title:thread.name??thread.preview??thread.id,updatedAt:thread.updatedAt,cwd:thread.cwd})),nextCursor:value.nextCursor??null};
    }else if(endpoint==='thread/create'){
     if(body.cwd!==undefined&&typeof body.cwd!=='string')throw rpcCode('request/invalid','cwd must be a path string');
-    const cwd=body.cwd?.trim()||CWD;const override=validateDeveloperInstructions(body.developerInstructions);const developerInstructions=await effectiveDeveloperInstructions(null,override??undefined);const params={cwd,developerInstructions,...(body.model?{model:body.model}:{}),...(body.provider?{modelProvider:body.provider}:{}),...(body.approvalPolicy?{approvalPolicy:body.approvalPolicy}:{})};
+    if(body.config!==undefined&&(!body.config||typeof body.config!=='object'||Array.isArray(body.config)))throw rpcCode('request/invalid','config must be an object');
+    const cwd=body.cwd?.trim()||CWD;const override=validateDeveloperInstructions(body.developerInstructions);const developerInstructions=await effectiveDeveloperInstructions(null,override??undefined);const params={cwd,developerInstructions,...(body.config?{config:body.config}:{}) ,...(body.model?{model:body.model}:{}),...(body.provider?{modelProvider:body.provider}:{}),...(body.approvalPolicy?{approvalPolicy:migrateApproval(body.approvalPolicy)}:{})};
     const value=await rpc.call('thread/start',params);const thread=value.thread;if(!thread?.id)throw rpcCode('codex/protocol','thread/start did not return a thread',502);loadingThreads.add(thread.id);if(override)threadInstructionOverrides.set(thread.id,override);threadInjectedInstructions.set(thread.id,developerInstructions);rememberThreadProvider(thread.id,value.modelProvider??params.modelProvider??null);result={threadId:thread.id,thread,channel:threadProviders.get(thread.id)??null,developerInstructions};broadcast({type:'thread.changed',threadId:thread.id});
    }else if(endpoint==='thread/resume'){
     const threadId = requireString(body, 'threadId');
@@ -1497,16 +1590,21 @@ const server=http.createServer(async(req,res)=>{
     const channel=await activeChannelRecord();
     const bound=threadProviders.get(threadId)??null;
     if(channel&&bound&&bound!==channel.id)throw rpcCode('channel/thread-binding',`这个会话绑在渠道「${bound}」上，不能直接发到「${channel.id}」`,409,{threadId,boundChannel:bound,activeChannel:channel.id,hint:'POST /api/thread/fork 把它搬到当前渠道，再发一次'});
-    const input=[];if(typeof body.text==='string'&&body.text.trim())input.push({type:'text',text:body.text});
-    for(const image of body.images??[]){if(typeof image==='string'&&/^data:image\//.test(image))input.push({type:'image',url:image});else throw rpcCode('request/image','Use a data:image URL for image input');}
-    if(!input.length)throw rpcCode('request/invalid','Text or image input is required');
+    const originalInput=[];if(typeof body.text==='string'&&body.text.trim())originalInput.push({type:'text',text:body.text});
+    const preparedAttachments=await stageLargeTextAttachments(body,{cwd:CWD});
+    const {input,warnings:attachmentWarnings}=buildCodexAttachmentInput(preparedAttachments,{input:originalInput});
+    if(!input.length)throw rpcCode('request/invalid','Text, image or file input is required');
     const prepared=await prepareThreadInstructions(threadId,body.developerInstructions===undefined?undefined:instructionOverride);threadId=prepared.threadId;
     turns.set(threadId,'starting');touchTurn(threadId);
-    const cfgModel=body.model??channel?.model??configValue(await rawConfig()).model;
+    const cfgNow=configValue(await rawConfig());
+    const cfgModel=body.model??channel?.model??cfgNow.model;
      const sandboxPolicies={'read-only':{type:'readOnly'},'workspace-write':{type:'workspaceWrite'},'danger-full-access':{type:'dangerFullAccess'}};
      if(body.sandboxMode!==undefined&&!sandboxPolicies[body.sandboxMode])throw rpcCode('config/sandbox','Unsupported sandbox mode');
      const sandboxPolicy=body.sandboxMode?sandboxPolicies[body.sandboxMode]:null;
-    try{const value=await rpc.call('turn/start',{threadId,input,summary:'auto',...(cfgModel?{model:cfgModel}:{}),...(body.reasoningEffort?{effort:body.reasoningEffort}:{}),...(body.approvalPolicy?{approvalPolicy:body.approvalPolicy}:{}),...(sandboxPolicy?{sandboxPolicy}:{})});const turnId=value.turn?.id;if(!turnId)throw rpcCode('codex/protocol','turn/start did not return a turn',502);if(turns.has(threadId))turns.set(threadId,turnId);result={threadId,turnId};}catch(error){turns.delete(threadId);throw error;}
+    // 记下这一轮真正的策略：App 传了就用 App 的，没传就沿用本机 config（手机上是 never/danger-full-access）。
+   threadApprovalPolicy.set(threadId,migrateApproval(body.approvalPolicy??cfgNow.approval_policy??'on-request'));
+   threadSandboxMode.set(threadId,body.sandboxMode??cfgNow.sandbox_mode??null);
+   try{const value=await rpc.call('turn/start',{threadId,input,summary:'auto',...(cfgModel?{model:cfgModel}:{}),...(body.reasoningEffort?{effort:body.reasoningEffort}:{}),...(body.approvalPolicy?{approvalPolicy:migrateApproval(body.approvalPolicy)}:{}),...(sandboxPolicy?{sandboxPolicy}:{})});const turnId=value.turn?.id;if(!turnId)throw rpcCode('codex/protocol','turn/start did not return a turn',502);if(turns.has(threadId))turns.set(threadId,turnId);result={threadId,turnId,...(attachmentWarnings.length?{attachmentWarnings}:{})};}catch(error){turns.delete(threadId);throw error;}
    }else if(endpoint==='turn/interrupt'){
     const threadId=requireString(body,'threadId');const turnId=body.turnId??turns.get(threadId);if(!turnId||turnId==='starting')throw rpcCode('codex/no-active-turn','No interruptible turn is active',409);result=await rpc.call('turn/interrupt',{threadId,turnId});
    }else if(endpoint==='turn/active'){
@@ -1610,7 +1708,14 @@ const server=http.createServer(async(req,res)=>{
    }else if(endpoint==='approval'){
     const approvalId=requireString(body,'approvalId');const approval=pendingApprovals.get(approvalId);if(!approval)throw rpcCode('codex/approval-expired','Approval is no longer pending',409);
     const decisions=new Set(['accept','acceptForSession','decline','cancel']);if(!decisions.has(body.decision))throw rpcCode('request/invalid','Invalid approval decision');
-    if(approval.method.includes('permissions')){
+    if(approval.method==='mcpServer/elicitation/request'){
+     const action=body.decision==='decline'?'decline':body.decision==='cancel'?'cancel':'accept';
+     if(body.decision==='acceptForSession'){
+      const serverName=String(approval.params?.serverName??'');
+      if(serverName)sessionApprovedMcp.add(serverName);
+     }
+     rpc.reply(approval.id,{action,content:null,_meta:null});
+    }else if(approval.method.includes('permissions')){
      if(body.decision==='acceptForSession')rpc.reply(approval.id,{permissions:approval.params.permissions??{},scope:'session'});
      else rpc.reply(approval.id,{permissions:body.decision==='accept'?(approval.params.permissions??{}):{},scope:'turn'});
     }else rpc.reply(approval.id,{decision:body.decision});pendingApprovals.delete(approvalId);broadcast({type:'approval.resolved',approvalId,threadId:approval.params.threadId,decision:body.decision});result={ok:true};
@@ -1693,7 +1798,12 @@ process.on('SIGINT',shutdown);process.on('SIGTERM',shutdown);
 await mkdir(CODEX_HOME,{recursive:true,mode:0o700});
 // 兼容代理先起来：激活 chat 渠道时要把它的回环端口写进 codex 的 base_url。
 try{
- compatProxy=await startCompatProxy(0,'127.0.0.1',{lookupChannel:compatLookupChannel});
+ compatProxy=await startCompatProxy(0,'127.0.0.1',{lookupChannel:compatLookupChannel,onToolArgumentsDelta:event=>{
+  if(turns.get(event.threadId)!==event.turnId)return;
+  const enriched={type:'tool.args.delta',...event};
+  agentRegistry.accept(enriched);
+  broadcast(enriched);
+ }});
  compatPort=compatProxy.port;
  console.log(`Compatibility proxy: http://127.0.0.1:${compatPort}/v1/<channel>/responses`);
 }catch(error){
@@ -1701,6 +1811,7 @@ try{
  console.error('codex-go: compatibility proxy failed to start: '+scrub(error.message));
 }
 await workflowStore.load();
+try{agentRegistry.restore(JSON.parse(await readFile(AGENT_BOARD_FILE,'utf8')));}catch(error){if(error.code!=='ENOENT')console.error('codex-go: could not restore the agent board: '+scrub(error.message));}
 // 上下文设置要在第一个 tokenUsage 之前就读进内存（trackUsage 是同步的）。
 try{await readContextSettings();}catch(error){console.error('codex-go: context settings unreadable, using defaults: '+scrub(error.message));}
 try{

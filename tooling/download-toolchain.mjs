@@ -1,0 +1,12 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import {createHash} from 'node:crypto';
+import {Readable} from 'node:stream';
+import {pipeline} from 'node:stream/promises';
+const root=path.resolve('codex-go/tooling/cache');fs.mkdirSync(root,{recursive:true});
+async function json(url){const r=await fetch(url,{signal:AbortSignal.timeout(45000)});if(!r.ok)throw Error(`${url}: ${r.status}`);return r.json();}
+async function download(url,name,want){const out=path.join(root,name);if(fs.existsSync(out)&&want){const hash=createHash('sha256');for await(const chunk of fs.createReadStream(out))hash.update(chunk);if(hash.digest('hex')===want){console.log(`verified ${name}`);return;}}
+ console.log(`download ${name}`);const r=await fetch(url,{signal:AbortSignal.timeout(3600000)});if(!r.ok)throw Error(`${name}: HTTP ${r.status}`);const hash=createHash('sha256');let bytes=0,last=Date.now();const partial=out+'.part';await pipeline(Readable.fromWeb(r.body),async function*(source){for await(const chunk of source){hash.update(chunk);bytes+=chunk.length;if(Date.now()-last>15000){console.log(`${name}: ${(bytes/2**20).toFixed(0)} MiB`);last=Date.now();}yield chunk;}},fs.createWriteStream(partial));const sha=hash.digest('hex');if(want&&sha!==want)throw Error(`${name}: SHA256 mismatch ${sha}`);fs.renameSync(partial,out);console.log(JSON.stringify({name,bytes,sha256:sha}));}
+const flutter=JSON.parse(fs.readFileSync(path.join(root,'flutter-release.json'),'utf8'));
+const tasks=[()=>download(`${flutter.base}/flutter_infra_release/releases/${flutter.archive}`,'flutter.zip',flutter.sha256),async()=>{const releases=await json('https://api.adoptium.net/v3/assets/latest/17/hotspot?architecture=x64&image_type=jdk&os=windows&vendor=eclipse');const p=releases[0].binary.package;await download(p.link,'jdk.zip',p.checksum);},async()=>{const rel=await json('https://api.github.com/repos/git-for-windows/git/releases/latest');const asset=rel.assets.find(a=>/^MinGit-.*-64-bit\.zip$/.test(a.name));if(!asset)throw Error('MinGit asset missing');await download(asset.browser_download_url,'git.zip',asset.digest?.replace('sha256:',''));},()=>download('https://dl.google.com/android/repository/commandlinetools-win-13114758_latest.zip','android-tools.zip')];
+const results=await Promise.allSettled(tasks.map(task=>task()));for(let i=0;i<results.length;i++)if(results[i].status==='rejected'){console.error(`task ${i}: ${results[i].reason.stack}`);process.exitCode=1;}

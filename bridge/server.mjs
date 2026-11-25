@@ -779,7 +779,12 @@ async function subagentRun(body){
  if(body.title!==undefined&&(typeof body.title!=='string'||!body.title.trim()||body.title.length>200))throw rpcCode('request/invalid','title must be a nonempty string of at most 200 characters');
  for(const key of ['name','role','parentId','parentThreadId'])if(body[key]!==undefined&&(typeof body[key]!=='string'||body[key].length>200))throw rpcCode('request/invalid',`${key} must be a string of at most 200 characters`);
  const cwd=body.cwd?path.resolve(body.cwd):CWD,model=body.model?.trim(),timeoutMs=integerField(body,'timeoutMs',1000,1800000,600000);
- const {agentId}=agentRegistry.queue({name:body.name??body.title,role:body.role,task:prompt,parentId:body.parentId,parentThreadId:body.parentThreadId});
+ // MCP 工具进程拿不到"哪个主线程在等这个结果"。模型在某个对话里派发子代理时，
+  // 用最近一个处于回合中的主线程作为父会话，这样成员只挂在真正派发过它的对话上。
+  const activeParents=[...turns.entries()].filter(([id])=>!agentRegistry.subagentThreads.has(id)).map(([id])=>id);
+  const inferredParent=activeParents.length===1?activeParents[0]:null;
+  const parentThreadId=body.parentThreadId??inferredParent??null;
+  const {agentId}=agentRegistry.queue({name:body.name??body.title,role:body.role,task:prompt,parentId:body.parentId,parentThreadId});
  const run={id:`sub-${++subagentSeq}`,threadId:null,title:body.title?.trim()??(prompt.split('\n')[0].slice(0,80)||'Subagent run'),status:'running',startedAt:Date.now(),finishedAt:null,preview:prompt.slice(0,160)};
  subagentRuns.unshift(run);if(subagentRuns.length>SUBAGENT_RUNS)subagentRuns.length=SUBAGENT_RUNS;
  let threadId=null,turnId=null,watcher=null;

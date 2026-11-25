@@ -118,10 +118,18 @@ class CodexAgentsState extends ChangeNotifier {
 
   bool _matches(Map data) => parentThreadId == null || data['parentThreadId'] == parentThreadId;
 
+  /// 新成员排队的信号：UI 用它把"当前对话"记为派发过子 Agent 的会话。
+  bool _freshQueued = false;
+  bool get hasFreshQueued => _freshQueued;
+  void consumeFreshQueued() => _freshQueued = false;
+
   void apply(Map event) {
     if (!'${event['type']}'.startsWith('agent.') || !_matches(event)) return;
     final id = '${event['agentId'] ?? ''}';
     if (id.isEmpty) return;
+    if (event['type'] == 'agent.status' && '${event['state']}' == 'queued' && !_agents.containsKey(id)) {
+      _freshQueued = true;
+    }
     final version = _integer(event['boardVersion']);
     if (version > (_liveVersions[id] ?? 0)) _liveVersions[id] = version;
     if (event['type'] == 'agent.removed') {

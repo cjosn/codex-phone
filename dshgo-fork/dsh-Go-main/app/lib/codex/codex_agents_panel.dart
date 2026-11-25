@@ -5,11 +5,21 @@ import 'codex_theme.dart';
 
 /// Independent task board, usable in a bottom sheet or as a full page body.
 class CodexAgentsPanel extends StatefulWidget {
-  const CodexAgentsPanel({super.key, required this.state, this.refresh, this.theme, this.onOpenConversation});
+  const CodexAgentsPanel({
+    super.key,
+    required this.state,
+    this.refresh,
+    this.theme,
+    this.onOpenConversation,
+    this.focusThreadId,
+  });
   final CodexAgentsState state;
   final Future<void> Function()? refresh;
   final CodexTheme? theme;
   final void Function(CodexAgent agent)? onOpenConversation;
+
+  /// 只展示这个对话派发的成员；null 表示全部。
+  final String? focusThreadId;
 
   @override
   State<CodexAgentsPanel> createState() => _CodexAgentsPanelState();
@@ -47,7 +57,9 @@ class _CodexAgentsPanelState extends State<CodexAgentsPanel> {
   Widget build(BuildContext context) => AnimatedBuilder(
     animation: widget.state,
     builder: (context, _) {
-      final agents = widget.state.agents;
+      final all = widget.state.agents;
+      final focus = widget.focusThreadId;
+      final agents = focus == null ? all : all.where((a) => a.parentThreadId == focus).toList();
       final active = agents.where((a) => a.active).length;
       return Material(
         color: theme.background,
@@ -97,7 +109,11 @@ class _CodexAgentsPanelState extends State<CodexAgentsPanel> {
                         child: Padding(
                           padding: const EdgeInsets.all(24),
                           child: Text(
-                            _loading ? '正在加载 Agent…' : '暂无 Agent 任务\n派发子任务后，可在这里查看进度与日志。',
+                            _loading
+                                ? '正在加载 Agent…'
+                                : (widget.focusThreadId != null
+                                      ? '这个对话还没有子 Agent\n让主对话派发任务后，成员会出现在这里。'
+                                      : '暂无 Agent 任务\n派发子任务后，可在这里查看进度与日志。'),
                             textAlign: TextAlign.center,
                             style: TextStyle(color: theme.muted, height: 1.7),
                           ),

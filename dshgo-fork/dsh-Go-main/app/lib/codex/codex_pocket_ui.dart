@@ -192,6 +192,10 @@ class _CodexPocketHomeState extends State<CodexPocketHome> with WidgetsBindingOb
   String? _agentReturnCandidate;
   bool _openingAgent = false;
   bool _wasConnected = false;
+
+  /// 哪些主对话真的派发过子 Agent（桥推断不到父 ID 时的兜底）。
+  /// 谁置位：当前对话回合里收到新的 agent.status(queued)；谁清除：仅随 App 数据清除。
+  final Set<String> _dispatchedThreads = <String>{};
   String? _activeAgentThreadId;
   String _activeAgentName = '';
 
@@ -488,6 +492,12 @@ class _CodexPocketHomeState extends State<CodexPocketHome> with WidgetsBindingOb
 
   void _changed() {
     if (!mounted) return;
+    // 记住"这个对话派发过子 Agent"：桥只在有新成员排队时发出 queued。
+    final thread = state.threadId;
+    if (thread != null && state.agents.hasFreshQueued) {
+      _dispatchedThreads.add(thread);
+      state.agents.consumeFreshQueued();
+    }
     if (state.connected && !_wasConnected) {
       _wasConnected = true;
       unawaited(_loadAgentBoard());
@@ -672,7 +682,6 @@ class _CodexPocketHomeState extends State<CodexPocketHome> with WidgetsBindingOb
                     children: [
                       _agentStrip(),
                       Expanded(child: _conversation()),
-                      _chatAgentAppendix(),
                       if (_activeAgentThreadId != null) _agentConversationBanner(),
                       if (state.statusHint != null) _statusHintLine(state.statusHint!),
                       _composerBox(),
@@ -710,7 +719,7 @@ class _CodexPocketHomeState extends State<CodexPocketHome> with WidgetsBindingOb
       children: [
         Icon(Icons.circle, size: 8, color: state.connected ? const Color(0xff36845d) : Colors.grey),
         const SizedBox(width: 7),
-        Expanded(
+        Flexible(
           child: Text(
             _taskTitle(),
             maxLines: 1,
@@ -718,27 +727,41 @@ class _CodexPocketHomeState extends State<CodexPocketHome> with WidgetsBindingOb
             style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 15),
           ),
         ),
+        // 与 DSH 一致：只有这个对话真的派发过子 Agent，才在主对话旁显示成员入口。
+        AnimatedBuilder(
+          animation: state.agents,
+          builder: (context, _) {
+            final members = _agentsForCurrentThread();
+            if (members.isEmpty) return const SizedBox.shrink();
+            final running = members.where((agent) => agent.active).length;
+            return Padding(
+              padding: const EdgeInsets.only(left: 6),
+              child: TextButton.icon(
+                key: const Key('thread-agents-pill'),
+                style: TextButton.styleFrom(
+                  visualDensity: VisualDensity.compact,
+                  padding: const EdgeInsets.symmetric(horizontal: 8),
+                  minimumSize: const Size(0, 28),
+                  backgroundColor: _theme.background.withValues(alpha: 0.6),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+                ),
+                onPressed: () => _openAgents(focusThread: state.threadId),
+                icon: Icon(
+                  running > 0 ? Icons.autorenew : Icons.groups_2_outlined,
+                  size: 15,
+                  color: running > 0 ? const Color(0xff7a6320) : _theme.accent,
+                ),
+                label: Text(
+                  running > 0 ? '$running/${members.length}' : '${members.length}',
+                  style: TextStyle(fontSize: 12, color: _theme.ink, fontWeight: FontWeight.w600),
+                ),
+              ),
+            );
+          },
+        ),
       ],
     ),
     actions: [
-      AnimatedBuilder(
-        animation: state.agents,
-        builder: (context, _) {
-          final running = state.agents.agents
-              .where((agent) => agent.state == 'running' || agent.state == 'queued')
-              .length;
-          return IconButton(
-            key: const Key('open-agents'),
-            tooltip: '子 Agent 任务面板',
-            onPressed: _openAgents,
-            icon: Badge(
-              isLabelVisible: running > 0,
-              label: Text('$running'),
-              child: const Icon(Icons.account_tree_outlined, size: 20),
-            ),
-          );
-        },
-      ),
       PopupMenuButton<String>(
         tooltip: '会话操作',
         icon: const Icon(Icons.more_vert, size: 20),
@@ -782,7 +805,7 @@ class _CodexPocketHomeState extends State<CodexPocketHome> with WidgetsBindingOb
     ],
   );
 
-  Future<void> _openAgents() async {
+  Future<void> _openAgents({String? focusThread}) async {
     if (_activeAgentThreadId == null) _agentReturnCandidate = state.threadId;
     await showModalBottomSheet<void>(
       context: context,
@@ -793,18 +816,34 @@ class _CodexPocketHomeState extends State<CodexPocketHome> with WidgetsBindingOb
           child: CodexAgentsPanel(
             state: state.agents,
             theme: _theme,
+            focusThreadId: focusThread ?? state.threadId,
             refresh: () async {
               final snapshot = await state.client.get('/api/subagent/tree');
               state.agents.replaceSnapshot(snapshot);
             },
-            onOpenConversation: _openAgentConversation,
+            onOpenConversation: (agent) => _openAgentConversation(agent, fromSheet: true),
           ),
         ),
       ),
     );
   }
 
-  Future<void> _openAgentConversation(CodexAgent agent) async {
+  /// 只把「这个对话派发的」子代理算作成员：显式父 ID 匹配，或这个对话在
+  /// 本机记录里确实派发过（桥推断不到父 ID 时的兜底）。没有成员就不显示入口。
+  List<CodexAgent> _agentsForCurrentThread() {
+    final thread = state.threadId;
+    if (thread == null || thread.isEmpty) return const [];
+    final dispatched = _dispatchedThreads.contains(thread);
+    return state.agents.agents.where((agent) {
+      final parent = agent.parentThreadId;
+      if (parent != null && parent.isNotEmpty) return parent == thread;
+      return dispatched;
+    }).toList();
+  }
+
+  /// 只有从底部面板进入时才需要先关掉面板；从附录条进入时不能 pop，
+  /// 否则会把主页面自己弹出导航栈（真机表现为整屏黑）。
+  Future<void> _openAgentConversation(CodexAgent agent, {bool fromSheet = false}) async {
     final childThread = agent.agentThreadId;
     if (childThread == null || childThread.isEmpty) {
       showCodexMessage(context, '这个子 Agent 的会话已经不可用');
@@ -821,7 +860,7 @@ class _CodexPocketHomeState extends State<CodexPocketHome> with WidgetsBindingOb
         : (recordedParent != null && recordedParent.isNotEmpty && recordedParent != childThread
               ? recordedParent
               : (current != null && current != childThread ? current : null));
-    Navigator.of(context).pop();
+    if (fromSheet) Navigator.of(context).pop();
     setState(() {
       _agentParentThread = parent;
       _activeAgentThreadId = childThread;
@@ -888,61 +927,6 @@ class _CodexPocketHomeState extends State<CodexPocketHome> with WidgetsBindingOb
       ],
     ),
   );
-
-  /// 主对话下方的「子 Agent 附录」：子会话不进历史列表，只挂在这里，
-  /// 点一条即可进入那个独立对话继续派任务。
-  Widget _chatAgentAppendix() {
-    if (_activeAgentThreadId != null) return const SizedBox.shrink();
-    final agents = state.agents.agents.where((agent) => agent.agentThreadId?.isNotEmpty == true).toList();
-    if (agents.isEmpty) return const SizedBox.shrink();
-    final running = agents.where((agent) => agent.active).length;
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 0, 16, 6),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            children: [
-              const Icon(Icons.account_tree_outlined, size: 15, color: Color(0xff5d6b52)),
-              const SizedBox(width: 5),
-              Text(
-                '子 Agent（${agents.length}${running > 0 ? ' · $running 运行中' : ''}）',
-                style: const TextStyle(fontSize: 11.5, color: Color(0xff5d6b52), fontWeight: FontWeight.w600),
-              ),
-              const Spacer(),
-              Text('不占用历史会话', style: TextStyle(fontSize: 10.5, color: _theme.muted)),
-            ],
-          ),
-          const SizedBox(height: 6),
-          SizedBox(
-            height: 34,
-            child: ListView.separated(
-              scrollDirection: Axis.horizontal,
-              itemCount: agents.length,
-              separatorBuilder: (_, _) => const SizedBox(width: 8),
-              itemBuilder: (context, index) {
-                final agent = agents[index];
-                return ActionChip(
-                  key: ValueKey('appendix-agent-${agent.agentId}'),
-                  avatar: Icon(
-                    agent.active
-                        ? Icons.autorenew
-                        : (agent.state == 'done' ? Icons.check_circle_outline : Icons.error_outline),
-                    size: 15,
-                    color: agent.active
-                        ? const Color(0xff7a6320)
-                        : (agent.state == 'done' ? const Color(0xff2f5d3a) : const Color(0xff8b2b20)),
-                  ),
-                  label: Text(agent.name, style: const TextStyle(fontSize: 11.5)),
-                  onPressed: () => _openAgentConversation(agent),
-                );
-              },
-            ),
-          ),
-        ],
-      ),
-    );
-  }
 
   /// 标题栏两枚 20px 图标（汉堡 + 历史），总宽压在 96 以内，别把标题挤没了。
   static const double _appBarLeadingWidth = 92;
